@@ -1,4 +1,8 @@
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { PoeLedger } from "@/lib/poe/ledger";
 import { ExecutionArtifactStore } from "@/lib/db/operations/artifacts";
 import type { ExecutionBudget } from "@/lib/db/operations/budgets";
 import { ExecutionBudgetTracker } from "@/lib/db/operations/budgets";
@@ -333,5 +337,114 @@ describe("releaseExecutionRun", () => {
     expect(artifacts.get(outcome.correlationId, 2)).toBeUndefined();
     expect(artifacts.size).toBe(0);
     expect(tracker.usage("run-1")).toEqual({ activeExecutions: 0, executedStatements: 0, totalElapsedMs: 0 });
+  });
+});
+
+describe("PoE integration", () => {
+  let dir: string;
+  let saved: NodeJS.ProcessEnv;
+  beforeEach(() => {
+    saved = { ...process.env };
+    dir = mkdtempSync(join(tmpdir(), "pulse-execution-"));
+    process.env.POE_ENABLED = "true";
+    process.env.POE_SQLITE_PATH = join(dir, "poe.sqlite");
+    delete process.env.POE_ESTIMATED_WATTS;
+  });
+  afterEach(() => {
+    for (const key of ["POE_ENABLED", "POE_SQLITE_PATH", "POE_ESTIMATED_WATTS"]) {
+      if (saved[key] === undefined) delete process.env[key];
+      else process.env[key] = saved[key];
+    }
+    rmSync(dir, { recursive: true, force: true });
+  });
+  function context() {
+    return {
+      runId: "poe-run",
+      tracker: new ExecutionBudgetTracker(),
+      artifacts: new ExecutionArtifactStore({ ttlMs: 60_000, maxArtifacts: 8 }),
+      clock: stubClock(0, 10),
+    };
+  }
+  test("writes the decision before invoke and persists success without SQL or data", async () => {
+    const file = process.env.POE_SQLITE_PATH!;
+    const ctx = context();
+    await executeAuditedOperation(baseParams(), ctx, async () => {
+      expect(new PoeLedger(file).read(0, 10).records[0].event.status).toBe("allow");
+      return { secret: "private-result" };
+    });
+    const records = new PoeLedger(file).read(0, 10).records;
+    expect(records[1].event.status).toBe("success");
+    expect(records[1].event.durationMs).toBe(10);
+    expect(JSON.stringify(records)).not.toContain("SELECT");
+    expect(JSON.stringify(records)).not.toContain("private-result");
+    expect(ctx.tracker.usage(ctx.runId).activeExecutions).toBe(0);
+  });
+  test("persists refusals without touching the provider", async () => {
+    const invoke = mock(async () => null);
+    await executeAuditedOperation(baseParams({ actor: { ...actor, role: "intruder" as "user" } }), context(), invoke);
+    expect(invoke).not.toHaveBeenCalled();
+    expect(new PoeLedger(process.env.POE_SQLITE_PATH!).read(0, 10).records[0].event.status).toBe("deny");
+  });
+  test("records failures and preserves the provider error", async () => {
+    const error = new Error("private-driver-error");
+    const ctx = context();
+    await expect(
+      executeAuditedOperation(baseParams(), ctx, async () => {
+        throw error;
+      }),
+    ).rejects.toBe(error);
+    const records = new PoeLedger(process.env.POE_SQLITE_PATH!).read(0, 10).records;
+    expect(records[1].event.status).toBe("failure");
+    expect(JSON.stringify(records)).not.toContain("private-driver-error");
+    expect(ctx.tracker.usage(ctx.runId).activeExecutions).toBe(0);
+  });
+  test("ledger failure before execution fails closed without reserving a slot", async () => {
+    const blocked = join(dir, "file");
+    writeFileSync(blocked, "not-a-directory");
+    process.env.POE_SQLITE_PATH = join(blocked, "poe.sqlite");
+    const invoke = mock(async () => null);
+    const ctx = context();
+    await expect(executeAuditedOperation(baseParams(), ctx, invoke)).rejects.toThrow();
+    expect(invoke).not.toHaveBeenCalled();
+    expect(ctx.tracker.usage(ctx.runId).activeExecutions).toBe(0);
+  });
+  test("outcome storage failure releases budget and leaves a pending decision", async () => {
+    const ctx = context();
+    const file = process.env.POE_SQLITE_PATH!;
+    const realAppend = PoeLedger.prototype.append;
+    const append = spyOn(PoeLedger.prototype, "append");
+    append
+      .mockImplementationOnce((event) => realAppend.call(new PoeLedger(file), event))
+      .mockImplementationOnce(() => {
+        throw new Error("disk full");
+      });
+    try {
+      await expect(executeAuditedOperation(baseParams(), ctx, async () => null)).rejects.toThrow("disk full");
+      expect(ctx.tracker.usage(ctx.runId).activeExecutions).toBe(0);
+      const records = new PoeLedger(file).read(0, 10).records;
+      expect(records).toHaveLength(1);
+      expect(records[0].event.phase).toBe("decision");
+    } finally {
+      append.mockRestore();
+    }
+  });
+  test("reports both provider and outcome storage failure", async () => {
+    const ctx = context();
+    const append = spyOn(PoeLedger.prototype, "append");
+    append
+      .mockImplementationOnce(() => {})
+      .mockImplementationOnce(() => {
+        throw new Error("disk full");
+      });
+    try {
+      await expect(
+        executeAuditedOperation(baseParams(), ctx, async () => {
+          throw new Error("provider");
+        }),
+      ).rejects.toBeInstanceOf(AggregateError);
+      expect(ctx.tracker.usage(ctx.runId).activeExecutions).toBe(0);
+    } finally {
+      append.mockRestore();
+    }
   });
 });

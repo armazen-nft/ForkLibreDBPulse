@@ -31,6 +31,7 @@
 
 import { randomUUID } from "node:crypto";
 import { type AuditReason, emitAuditEvent } from "@/lib/audit";
+import { beginPoeOperation } from "@/lib/poe/operation";
 import type { ExecutionArtifactStore } from "./artifacts";
 import type { ExecutionBudget, ExecutionBudgetTracker } from "./budgets";
 import type { ExecutionActor, PolicyDecision, PolicyDenyCode, PolicyEvaluationParams } from "./policy";
@@ -152,6 +153,14 @@ export async function executeAuditedOperation<T>(
   const resolution = params.registry.resolve(params.request?.operationId as string);
   const action = resolution.kind === "resolved" ? resolution.descriptor.id : UNRESOLVED_OPERATION;
   const user = actorLabel(params.actor);
+  const poeOperation = {
+    runId,
+    correlationId,
+    operationId: action,
+    actor: user,
+    decision: decision.kind,
+    reason: decision.reasonCode,
+  };
 
   if (decision.kind !== "allow") {
     emitAuditEvent({
@@ -163,6 +172,7 @@ export async function executeAuditedOperation<T>(
       reason: refusalReason(decision),
       correlationId,
     });
+    beginPoeOperation(poeOperation);
     return { kind: "denied", correlationId, decision };
   }
 
@@ -174,6 +184,10 @@ export async function executeAuditedOperation<T>(
     result: "success",
     correlationId,
   });
+
+  // Synchronous durable decision, before admission or provider access. When PoE
+  // is enabled, a storage/configuration error fails closed without consuming a slot.
+  const finishPoe = beginPoeOperation(poeOperation);
 
   const startedAtMs = clock();
   tracker.beginExecution(runId);
@@ -198,6 +212,13 @@ export async function executeAuditedOperation<T>(
       duration: failedAfterMs,
       correlationId,
     });
+    try {
+      finishPoe?.("failure", failedAfterMs);
+    } catch (poeError) {
+      throw new AggregateError([error, poeError], "Provider failed and PoE outcome could not be persisted", {
+        cause: poeError,
+      });
+    }
     throw error;
   }
 
@@ -215,6 +236,7 @@ export async function executeAuditedOperation<T>(
     duration: elapsedMs,
     correlationId,
   });
+  finishPoe?.("success", elapsedMs);
   // `createdAtMs` is the START instant, so the TTL is measured from when the
   // statement began, not from when it returned.
   artifacts.put(

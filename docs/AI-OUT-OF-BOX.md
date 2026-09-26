@@ -1,5 +1,7 @@
 # AI OUT OF BOX — base LibreDB
 
+> Diagnóstico histórico da importação inicial. A integração PoE/SBL foi implementada posteriormente; consulte [POE-SBL.md](POE-SBL.md) para comportamento e configuração atuais. As referências abaixo a funcionalidades ainda não implementadas descrevem o estado da importação.
+
 ## Entrega e estado
 
 Clone integral em `ai-out-of-box/`, com histórico Git e licença MIT original preservados. Origem: https://github.com/libredb/libredb-studio. Commit verificado: `1039c1d45032e024e698136cd8ca7c1ad981dc62`, versão 0.16.0. Branch local: `codex/ai-out-of-box`; remoto de origem: `upstream`.

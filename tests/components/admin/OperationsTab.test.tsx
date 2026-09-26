@@ -475,7 +475,7 @@ describe("OperationsTab", () => {
       renderResult = render(<OperationsTab />);
     });
     const { container } = renderResult!;
-    expect(container.textContent).toMatch(/1,?000/);
+    expect(container.textContent).toContain((1_000).toLocaleString());
   });
 
   test("shows connection type in selector", async () => {
